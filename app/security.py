@@ -106,6 +106,18 @@ def is_encrypted(value: str) -> bool:
     return bool(value) and value.startswith("gAAAAA")
 
 
+def is_encryption_active() -> bool:
+    """True once :func:`init_encryption` has run with a real key.
+
+    Before that, :func:`encrypt`/:func:`decrypt` are no-ops that return
+    their input unchanged (see their docstrings) — a caller that needs to
+    know whether encryption is *actually happening* (e.g. a one-time
+    plaintext-to-ciphertext migration, which must never mistake a no-op
+    "encrypt" for a real one) should check this first rather than assume.
+    """
+    return _fernet is not None
+
+
 # ---------------------------------------------------------------------------
 # SQLAlchemy TypeDecorator for transparent column encryption
 # ---------------------------------------------------------------------------

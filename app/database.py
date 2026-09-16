@@ -66,6 +66,70 @@ async def get_db():
 # A clean database will be created by init_db() using SQLAlchemy metadata.
 
 
+async def encrypt_plaintext_oauth_tokens(conn) -> dict[str, int]:
+    """One-time-in-effect backfill: encrypt any OAuth token columns that
+    still hold plaintext (OUTBOUND-QUICKLY-0B — gmail_account/
+    office365_account/app_user's token columns moved from ``Text`` to
+    :class:`app.security.EncryptedText`; existing rows written before that
+    change still hold raw plaintext on disk until this runs once).
+
+    Idempotent by VALUE, not by a migration-tracking row: every value is
+    checked with :func:`app.security.is_encrypted` (Fernet ciphertext
+    always starts with ``"gAAAAA"``) before touching it, so running this
+    on every startup — or by hand, any number of times — never
+    double-encrypts an already-encrypted value and never touches a NULL or
+    empty column. There is deliberately no rollback path: Fernet
+    encryption isn't reversible without the key, so "rollback" in practice
+    means keeping ``QUICKLY_ENCRYPTION_KEY`` (or the DB-stored equivalent)
+    available — the same requirement any encrypted column already has.
+
+    Must run AFTER real encryption is active (see ``init_db`` — this is
+    called only after ``initialize_settings`` has loaded/auto-generated
+    the real Fernet key). Calling :func:`app.security.encrypt` before that
+    would silently return the plaintext unchanged, turning this function
+    into a silent no-op instead of doing its job — so it refuses to run
+    at all rather than risk that, via :func:`app.security.is_encryption_active`.
+
+    No token value is ever logged; only per-column migrated counts are
+    returned (see the one INFO log line in ``init_db``).
+    """
+    from sqlalchemy import text
+
+    from app.security import encrypt, is_encrypted, is_encryption_active
+
+    if not is_encryption_active():
+        raise RuntimeError(
+            "encrypt_plaintext_oauth_tokens called before encryption was "
+            "initialised — refusing to silently no-op and leave OAuth "
+            "tokens in plaintext. This is a bug in call ordering (should "
+            "always run after initialize_settings), not a config problem."
+        )
+
+    targets = [
+        ("gmail_account", "access_token"),
+        ("gmail_account", "refresh_token"),
+        ("office365_account", "access_token"),
+        ("office365_account", "refresh_token"),
+        ("app_user", "notif_access_token"),
+        ("app_user", "notif_refresh_token"),
+    ]
+    migrated_counts: dict[str, int] = {}
+    for table, column in targets:
+        rows = (await conn.execute(text(f"SELECT id, {column} FROM {table}"))).fetchall()
+        migrated = 0
+        for row_id, value in rows:
+            if not value or is_encrypted(value):
+                continue
+            await conn.execute(
+                text(f"UPDATE {table} SET {column} = :val WHERE id = :row_id"),
+                {"val": encrypt(value), "row_id": row_id},
+            )
+            migrated += 1
+        if migrated:
+            migrated_counts[f"{table}.{column}"] = migrated
+    return migrated_counts
+
+
 async def _run_migrations(conn) -> None:
     """Apply incremental schema changes to existing databases.
 
@@ -296,6 +360,23 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         await _run_migrations(conn)
 
-    # Load settings from database into memory
+    # Load settings from database into memory — this is what actually
+    # activates real Fernet encryption (env QUICKLY_ENCRYPTION_KEY, or the
+    # auto-generated one stored in app_setting on first run).
     async with AsyncSessionLocal() as session:
         await initialize_settings(session)
+
+    # OAuth-token plaintext backfill (OUTBOUND-QUICKLY-0B) — must run AFTER
+    # initialize_settings so real encryption is guaranteed active; Postgres
+    # only, same rationale as _run_migrations' own Postgres-only gate (a
+    # SQLite/test database is always freshly created from current models,
+    # so it never has pre-encryption-column plaintext rows to migrate).
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as conn:
+            migrated = await encrypt_plaintext_oauth_tokens(conn)
+        if migrated:
+            import logging
+
+            logging.getLogger("quickly.security").info(
+                "encrypt_plaintext_oauth_tokens: migrated %s", migrated
+            )

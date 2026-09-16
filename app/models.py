@@ -21,6 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Index,
+    text as _sa_text,
 )
 from sqlalchemy.orm import relationship
 from app.time import utcnow as _utcnow
@@ -48,6 +49,27 @@ class User(Base):
     __tablename__ = "app_user"
     __table_args__ = (
         UniqueConstraint("oauth_provider", "oauth_sub", name="uq_user_oauth"),
+        # First-admin bootstrap hardening (OUTBOUND-QUICKLY-0B): both
+        # register() (routers/auth.py) and the OAuth first-user path
+        # (routers/app_oauth.py) do "count existing users, if zero create
+        # this one as role='admin'" — a check-then-act race where two
+        # near-simultaneous requests could both pass the count check
+        # before either commits, creating two admins. Quickly has no
+        # "promote to admin" path anywhere else (grepped: role="admin" is
+        # only ever set at these two first-user call sites), so "at most
+        # one admin" is a real, always-true invariant, not a business rule
+        # this constraint could conflict with. A partial unique index
+        # makes the DB itself the atomic gate — the loser of the race gets
+        # a clean IntegrityError on flush (both call sites turn that into
+        # a normal "registration closed" response) instead of a second
+        # admin silently existing.
+        Index(
+            "uq_single_admin",
+            "role",
+            unique=True,
+            postgresql_where=_sa_text("role = 'admin'"),
+            sqlite_where=_sa_text("role = 'admin'"),
+        ),
     )
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(150), unique=True, nullable=False, index=True)
@@ -56,9 +78,12 @@ class User(Base):
     # OAuth identity (app login)
     oauth_provider = Column(String(32), nullable=True)   # "google" or "microsoft"
     oauth_sub = Column(String(255), nullable=True)        # provider's unique subject ID
-    # Notification email sending credentials (from OAuth login, separate from campaign inboxes)
-    notif_access_token = Column(Text, nullable=True)
-    notif_refresh_token = Column(Text, nullable=True)
+    # Notification email sending credentials (from OAuth login, separate from
+    # campaign inboxes) — same OAuth-token-at-rest issue as GmailAccount/
+    # Office365Account (found via the OUTBOUND-QUICKLY-0B "any other
+    # provider secrets stored as plaintext?" audit), same EncryptedText fix.
+    notif_access_token = Column(EncryptedText, nullable=True)
+    notif_refresh_token = Column(EncryptedText, nullable=True)
     notif_token_expiry = Column(DateTime, nullable=True)
     role = Column(String(32), default="user", nullable=False)  # admin or user (first user set explicitly to admin in router)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -498,13 +523,24 @@ class AppSetting(Base):
 
 
 class GmailAccount(Base):
-    """Stores Gmail/G Suite OAuth 2.0 tokens linked to an Inbox."""
+    """Stores Gmail/G Suite OAuth 2.0 tokens linked to an Inbox.
+
+    access_token/refresh_token use :class:`app.security.EncryptedText` —
+    the same Fernet-backed column type SmtpAccount's passwords already use —
+    so they are encrypted at rest whenever ``QUICKLY_ENCRYPTION_KEY`` is
+    configured (falls back to plaintext only if it is not, same behaviour
+    as every other EncryptedText column; see security.py). Transparent to
+    every caller: reading/writing ``.access_token``/``.refresh_token``
+    still just gets/sets a plain string, exactly as before this change —
+    see migrations/ for the one-time migration that encrypts any existing
+    plaintext rows.
+    """
     __tablename__ = "gmail_account"
     id = Column(Integer, primary_key=True, index=True)
     inbox_id = Column(Integer, ForeignKey("inbox.id"), nullable=False, unique=True)
     google_email = Column(String(255), nullable=False)
-    access_token = Column(Text, nullable=False)
-    refresh_token = Column(Text, nullable=False)
+    access_token = Column(EncryptedText, nullable=False)
+    refresh_token = Column(EncryptedText, nullable=False)
     token_expiry = Column(DateTime, nullable=True)
     scopes = Column(String(1024), default="https://www.googleapis.com/auth/gmail.send")
     created_at = Column(DateTime, default=_utcnow)
@@ -625,13 +661,17 @@ class GmailAttachment(Base):
 # ---------------------------------------------------------------------------
 
 class Office365Account(Base):
-    """Stores Microsoft Office 365 OAuth 2.0 tokens linked to an Inbox."""
+    """Stores Microsoft Office 365 OAuth 2.0 tokens linked to an Inbox.
+
+    access_token/refresh_token use :class:`app.security.EncryptedText` —
+    same rationale as GmailAccount above.
+    """
     __tablename__ = "office365_account"
     id = Column(Integer, primary_key=True, index=True)
     inbox_id = Column(Integer, ForeignKey("inbox.id"), nullable=False, unique=True)
     microsoft_email = Column(String(255), nullable=False)
-    access_token = Column(Text, nullable=False)
-    refresh_token = Column(Text, nullable=False)
+    access_token = Column(EncryptedText, nullable=False)
+    refresh_token = Column(EncryptedText, nullable=False)
     token_expiry = Column(DateTime, nullable=True)
     scopes = Column(String(1024), default="Mail.ReadWrite Mail.Send User.Read offline_access")
     created_at = Column(DateTime, default=_utcnow)
