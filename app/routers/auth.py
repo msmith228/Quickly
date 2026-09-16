@@ -1,7 +1,9 @@
 """Authentication API routes: register, login, token refresh, API key management."""
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta
 
@@ -19,6 +21,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import (
@@ -174,12 +177,53 @@ class RestoreSetupExecuteBody(BaseModel):
     restore_token: str = Field(..., min_length=10, max_length=256)
 
 
+def _check_restore_setup_token(request: Request) -> None:
+    """Opt-in hardening for pre-setup restore (OUTBOUND-QUICKLY-0B).
+
+    Pre-setup restore (the three endpoints below) is intentionally
+    reachable without authentication — there's no admin account yet to
+    authenticate as, and "I'm redeploying and want to restore my own
+    backup before creating a throwaway admin first" is a real,
+    legitimate use case (docs/INSTALL.md's whole restore flow depends on
+    this staying possible).
+
+    But that same unauthenticated reachability is a genuine pre-auth
+    takeover vector on a publicly-reachable deployment (e.g. a fresh
+    Railway URL): validate_custom_format_dump_file (app/backup_pg.py)
+    only checks that an uploaded file IS a well-formed pg_dump, never
+    that it came from THIS instance. Rate limiting (allow_restore_preview)
+    only slows repeated attempts — it does not stop a single well-crafted
+    upload from succeeding on the first try. Anyone who can reach the URL
+    before the real operator's first login could craft their own dump
+    (their own admin user, their own API keys) and restore it, silently
+    taking over the deployment.
+
+    QUICKLY_RESTORE_SETUP_TOKEN (unset by default — today's behaviour for
+    local/trusted deployments is unchanged) closes that gap when set:
+    every pre-setup restore call must then carry a matching
+    X-Restore-Setup-Token header. An operator sets this once via their
+    hosting platform's environment variables (Railway, etc.) — never
+    committed to source, same handling as QUICKLY_SECRET_KEY /
+    QUICKLY_ENCRYPTION_KEY.
+    """
+    required = os.getenv("QUICKLY_RESTORE_SETUP_TOKEN", "")
+    if not required:
+        return  # opt-in: unset means unchanged from today's behaviour
+    supplied = request.headers.get("x-restore-setup-token", "")
+    if not supplied or not hmac.compare_digest(supplied, required):
+        raise HTTPException(
+            status_code=403,
+            detail="Pre-setup restore requires a valid X-Restore-Setup-Token header.",
+        )
+
+
 @router.post("/restore-setup/metadata")
 async def restore_setup_metadata(
     request: Request,
     file: UploadFile = File(...),
 ):
     """Backup summary from file only (no password); same rate limit as restore preview."""
+    _check_restore_setup_token(request)
     ip = client_ip_from_request(request) or "unknown"
     if not allow_restore_preview(ip):
         raise HTTPException(
@@ -217,6 +261,7 @@ async def restore_setup_preview(
     password: str = Form(""),
 ):
     """Validate backup and return manifest + token; does not modify the database."""
+    _check_restore_setup_token(request)
     ip = client_ip_from_request(request) or "unknown"
     if not allow_restore_preview(ip):
         raise HTTPException(
@@ -257,11 +302,13 @@ async def restore_setup_preview(
 
 @router.post("/restore-setup/execute")
 async def restore_setup_execute(
+    request: Request,
     body: RestoreSetupExecuteBody,
     background_tasks: BackgroundTasks,
     response: Response,
 ):
     """Run restore after :func:`restore_setup_preview` returned a token."""
+    _check_restore_setup_token(request)
     async with AsyncSessionLocal() as db:
         if await is_setup_complete(db):
             raise HTTPException(
@@ -319,7 +366,18 @@ async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
         is_active=True,
     )
     db.add(user)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Two near-simultaneous first registrations both passed the
+        # is_setup_complete() check above before either committed — the
+        # uq_single_admin partial unique index (app/models.py) is the
+        # atomic backstop that catches this race; the loser lands here.
+        await db.rollback()
+        raise HTTPException(
+            status_code=403,
+            detail="Registration closed. Contact an admin to create new accounts.",
+        )
     log.info("First user registered: %s (admin)", user.username)
     return user
 

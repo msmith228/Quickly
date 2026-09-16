@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import (
@@ -227,7 +228,19 @@ async def _resolve_user_and_login(
             is_active=True,
         )
         db.add(user)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError:
+            # Same race as routers/auth.py's register(): two near-simultaneous
+            # first-user attempts (this OAuth path and/or the classic
+            # register endpoint) both passed the user_count==0 check above
+            # before either committed. uq_single_admin (app/models.py) is
+            # the atomic backstop; the loser lands here.
+            await db.rollback()
+            raise HTTPException(
+                403,
+                "No account found for this email. Contact your admin to create your account.",
+            )
         log.info("First user (admin) created via %s OAuth: %s", provider, email)
 
     if not user.is_active:
