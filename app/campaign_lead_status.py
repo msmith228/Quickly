@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 
 if TYPE_CHECKING:
     from app.models import CampaignLead, Lead
@@ -30,8 +30,24 @@ def interest_blocks_sends(interest: str | None) -> bool:
     return interest in ("not_interested", "out_of_office")
 
 
-def campaign_lead_may_receive_sends(cl: "CampaignLead", lead: "Lead") -> bool:
-    """True if this enrollment should be considered for outbound scheduling."""
+def campaign_lead_may_receive_sends(
+    cl: "CampaignLead", lead: "Lead", suppressed_emails: frozenset[str]
+) -> bool:
+    """True if this enrollment should be considered for outbound scheduling.
+
+    ``suppressed_emails`` (normalized, from
+    ``app.suppression.get_all_suppressed_emails``) is a required parameter,
+    not an optional one with a default — this is the authoritative
+    send-fire-time gate (OUTBOUND-SAFETY-0A), and a default of "no
+    suppression data" would let a caller silently skip the global
+    do-not-contact check by forgetting to pass it. Checked first, before
+    any campaign-scoped state, so global suppression always wins regardless
+    of enrollment/interest/verification status.
+    """
+    from app.suppression import normalize_email
+
+    if normalize_email(getattr(lead, "email", "")) in suppressed_emails:
+        return False
     ev = getattr(lead, "email_verification_status", None)
     if ev in VERIFICATION_BLOCKS_SEND:
         return False
@@ -53,7 +69,7 @@ def campaign_lead_schedule_eligibility_clause():
     ``campaign_lead_may_receive_sends`` plus the send job's ``stop_on_reply``
     rule so the schedule mirrors what the sender will actually deliver.
     """
-    from app.models import Campaign, CampaignLead, Lead, LeadReply
+    from app.models import Campaign, CampaignLead, GlobalSuppression, Lead, LeadReply
 
     _ver = tuple(VERIFICATION_BLOCKS_SEND)
     has_reply = exists(
@@ -61,6 +77,13 @@ def campaign_lead_schedule_eligibility_clause():
             LeadReply.lead_id == CampaignLead.lead_id,
             LeadReply.campaign_id == CampaignLead.campaign_id,
         )
+    )
+    # OUTBOUND-SAFETY-0A: keep new queue-slot scheduling from ever targeting
+    # a globally suppressed email. Complements (does not replace) the
+    # authoritative send-fire-time check in campaign_lead_may_receive_sends
+    # — this just avoids creating slots that would be dropped at send time.
+    is_suppressed = exists(
+        select(1).where(GlobalSuppression.email == func.lower(func.trim(Lead.email)))
     )
     return and_(
         CampaignLead.sending_paused.is_(False),
@@ -74,6 +97,7 @@ def campaign_lead_schedule_eligibility_clause():
             Lead.email_verification_status.notin_(_ver),
         ),
         or_(Campaign.stop_on_reply.is_(False), ~has_reply),
+        ~is_suppressed,
     )
 
 

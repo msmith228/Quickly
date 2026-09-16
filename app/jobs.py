@@ -44,6 +44,7 @@ from app.app_settings import get_google_oauth_credentials, get_office365_oauth_c
 from app import time as time_provider
 from app.queue_logic import _parse_time, compute_effective_daily_limit
 from app.campaign_lead_status import campaign_lead_may_receive_sends
+from app.suppression import add_suppression, get_all_suppressed_emails
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +103,11 @@ async def run_send_job():
 
     async with AsyncSessionLocal() as session:
         today = now.date()
+
+        # OUTBOUND-SAFETY-0A: one snapshot per job run, not per slot — this
+        # is the authoritative last-mile gate (checked again for every slot
+        # below), so it must be a required input, never silently skipped.
+        suppressed_emails = await get_all_suppressed_emails(session)
 
         result = await session.execute(select(Inbox).where(Inbox.paused == False))  # noqa: E712
         inboxes = result.scalars().all()
@@ -333,7 +339,7 @@ async def run_send_job():
                 if not _in_sending_window(now, campaign):
                     break
 
-                if not campaign_lead_may_receive_sends(cl, lead):
+                if not campaign_lead_may_receive_sends(cl, lead, suppressed_emails):
                     await session.delete(slot)
                     continue
                 if campaign.stop_on_reply:
@@ -783,6 +789,15 @@ async def run_send_job():
                                 QueueSlot.campaign_lead_id == cl.id,
                             )
                         )
+                        # OUTBOUND-SAFETY-0A: this branch only runs for
+                        # SendFailure (permanent) results — 429/5xx transient
+                        # failures return None and are retried elsewhere
+                        # without ever reaching here — so every bounce that
+                        # lands here is already a hard/permanent bounce.
+                        await add_suppression(
+                            session, lead.email, reason="hard_bounce",
+                            source="send_failure", note=(result.message or "")[:500],
+                        )
                         await fire_webhook_event(session, "email.bounced", {
                             "lead_id": lead.id,
                             "lead_email": lead.email,
@@ -1026,7 +1041,11 @@ async def send_slot_job(slot_id: int) -> None:
         if getattr(campaign, "paused", False):
             log.info("send_slot_job: campaign %d paused, skipping slot %d", campaign.id, slot_id)
             return
-        if not campaign_lead_may_receive_sends(cl, lead):
+        # OUTBOUND-SAFETY-0A: authoritative send-fire-time check, re-read
+        # immediately before delivery — blocks the send even if the address
+        # was suppressed after this slot was already enrolled/queued.
+        suppressed_emails = await get_all_suppressed_emails(session)
+        if not campaign_lead_may_receive_sends(cl, lead, suppressed_emails):
             log.info(
                 "send_slot_job: lead %d not sendable for campaign_lead %d, dropping slot %d",
                 lead.id, cl.id, slot_id,
@@ -1533,6 +1552,13 @@ async def send_slot_job(slot_id: int) -> None:
                 from sqlalchemy import delete as _sql_delete
                 await session.execute(
                     _sql_delete(QueueSlot).where(QueueSlot.campaign_lead_id == cl.id)
+                )
+                # OUTBOUND-SAFETY-0A: only permanent failures reach this
+                # branch (see the matching comment in run_send_job) — safe
+                # to treat every one as a hard bounce.
+                await add_suppression(
+                    session, lead.email, reason="hard_bounce",
+                    source="send_failure", note=(result.message or "")[:500],
                 )
                 await fire_webhook_event(session, "email.bounced", {
                     "lead_id": lead.id, "lead_email": lead.email,

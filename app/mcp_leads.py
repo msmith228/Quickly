@@ -2,14 +2,19 @@
 
 Originally "leads only" (module/server name kept as ``quickly-leads`` for
 URL/identity stability with existing mcp-remote configs); OUTBOUND-QUICKLY-0B
-added a small set of campaign-lifecycle, reply/Unibox, and analytics tools —
-see the instructions string below for the full, deliberately-short list.
-Every tool is a thin wrapper that proxies to the same REST endpoints the web
-UI calls (same auth, same validation, same business logic) — no tool talks
-to the database directly, and there is intentionally no send-email tool:
-an agent can prepare and control campaigns through these tools, but actual
-sending stays gated behind Quickly's own campaign engine and test-mode
-switch, never bypassed here.
+added a small set of campaign-lifecycle, reply/Unibox, and analytics tools;
+OUTBOUND-SAFETY-0A added global suppression / do-not-contact tools — see the
+instructions string below for the full, deliberately-short list. Every tool
+is a thin wrapper that proxies to the same REST endpoints the web UI calls
+(same auth, same validation, same business logic) — no tool talks to the
+database directly, and there is intentionally no send-email tool: an agent
+can prepare and control campaigns through these tools, but actual sending
+stays gated behind Quickly's own campaign engine and test-mode switch, never
+bypassed here. Global suppression is enforced the same way: these MCP tools
+let an agent check/manage it, but the authoritative gate is the database
+check inside app/campaign_lead_status.py, re-checked at enrollment-time and
+again at send-fire-time — an agent that never calls check_global_suppression
+is still protected.
 """
 
 from __future__ import annotations
@@ -36,10 +41,13 @@ leads_mcp = FastMCP(
     "quickly-leads",
     instructions=(
         "Quickly automation tools — leads, campaign lifecycle (list/get/create/"
-        "pause/resume), replies/Unibox (list/get thread), and per-campaign "
-        "analytics. No tool sends email; campaigns you create/resume here are "
+        "pause/resume), replies/Unibox (list/get thread), per-campaign "
+        "analytics, and global suppression / do-not-contact (check/add/remove/"
+        "list). No tool sends email; campaigns you create/resume here are "
         "still governed by Quickly's own test-mode switch and send-time "
-        "eligibility checks. Authenticate MCP HTTP requests with X-API-Key "
+        "eligibility checks — including global suppression, enforced in the "
+        "database regardless of what this agent does or forgets to check. "
+        "Authenticate MCP HTTP requests with X-API-Key "
         "(Settings → API Keys) or Authorization: Bearer (JWT)."
     ),
     # Default FastMCP host is 127.0.0.1, which enables MCP DNS-rebinding checks with
@@ -299,6 +307,65 @@ async def get_reply_thread(ctx: Context, thread_id: str, inbox_id: int | None = 
     url = f"{_api_base()}/api/unibox/threads/{thread_id}"
     params = {"inbox_id": str(inbox_id)} if inbox_id is not None else {}
     async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers, params=params)
+    return _json_response(r)
+
+
+# ---------------------------------------------------------------------------
+# Global suppression / do-not-contact (OUTBOUND-SAFETY-0A) — read/write, but
+# the authoritative safety gate is the database check in
+# app/campaign_lead_status.py::campaign_lead_may_receive_sends, not these
+# tools. An agent that forgets to call check_global_suppression before
+# enrolling a lead is still protected: enrollment and send-fire-time both
+# re-check the database directly (see app/routers/campaigns.py and
+# app/jobs.py). These tools exist so an agent CAN check/manage suppression
+# proactively, not so the system depends on it doing so.
+# ---------------------------------------------------------------------------
+
+
+@leads_mcp.tool()
+async def check_global_suppression(ctx: Context, email: str) -> str:
+    """Check whether an email is globally suppressed (do-not-contact) across every campaign."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/suppressions/check"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers=headers, params={"email": email})
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def add_global_suppression(
+    ctx: Context, email: str, reason: str = "manual_block", note: str | None = None
+) -> str:
+    """Add an email to the global suppression list — blocks it from every campaign, immediately and permanently, until explicitly removed. reason: unsubscribed, complaint, manual_block, customer, do_not_contact, or hard_bounce."""
+    headers = _outbound_headers(ctx)
+    headers["Content-Type"] = "application/json"
+    url = f"{_api_base()}/api/suppressions"
+    body: dict[str, Any] = {"email": email, "reason": reason, "source": "mcp"}
+    if note:
+        body["note"] = note
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, headers=headers, json=body)
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def remove_global_suppression(ctx: Context, email: str) -> str:
+    """Remove an email from the global suppression list. Explicit action only — nothing else in Quickly does this automatically."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/suppressions/{email}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.delete(url, headers=headers)
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def list_global_suppressions(ctx: Context, limit: int = 100, offset: int = 0) -> str:
+    """List globally suppressed emails, newest first."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/suppressions"
+    params = {"limit": str(limit), "offset": str(offset)}
+    async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(url, headers=headers, params=params)
     return _json_response(r)
 

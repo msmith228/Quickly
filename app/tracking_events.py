@@ -210,6 +210,20 @@ async def process_unsubscribe(db: AsyncSession, token: str) -> tuple[str, int]:
             )
         await db.execute(delete(QueueSlot).where(QueueSlot.campaign_lead_id == cl.id))
 
+    # OUTBOUND-SAFETY-0A: a genuine unsubscribe becomes global — this is
+    # the whole point of the safety layer: opting out of one campaign must
+    # stop every other campaign from ever contacting this address again.
+    # Per-campaign enrollment_status above is left as-is (complementary,
+    # not replaced). Idempotent (add_suppression no-ops if already present)
+    # so this is safe even on the already_done path.
+    if lead and lead.email:
+        from app.suppression import add_suppression
+
+        await add_suppression(
+            db, lead.email, reason="unsubscribed",
+            source="unsubscribe_link", note=f"campaign_id={row.campaign_id}",
+        )
+
     await db.commit()
 
     if not already_done and lead and cl:

@@ -35,6 +35,56 @@ from app.models import (
 )
 
 
+async def authenticated_api_key_headers(label: str) -> dict[str, str]:
+    """Return ``{"X-API-Key": ...}`` for SOME valid authenticated user —
+    safe to call from any test file even though Quickly allows exactly one
+    admin ever (uq_single_admin) and this suite's default test database is
+    shared across the whole pytest process (see test_mcp_tools.py's module
+    docstring). Tries the public register endpoint first (works if nothing
+    else in this process has registered an admin yet); if that's already
+    closed, creates a plain non-admin user directly via the ORM instead
+    (the single-admin restriction only applies to the public endpoint, not
+    to ordinary users) and mints its token directly rather than logging in
+    over HTTP, since there's no REST path to log in as a user we just
+    inserted without knowing a real password.
+    """
+    import httpx
+
+    from app.main import app as fastapi_app
+
+    suffix = uuid.uuid4().hex[:8]
+    username = f"{label}{suffix}"[:32]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://testserver") as client:
+        reg = await client.post(
+            "/api/auth/register",
+            json={"username": username, "email": f"{username}@test.com", "password": "TestPass123"},
+        )
+        if reg.status_code == 201:
+            login = await client.post("/api/auth/login", json={"username": username, "password": "TestPass123"})
+            assert login.status_code == 200, login.text
+            jwt = login.json()["access_token"]
+        else:
+            from app.auth import create_access_token
+            from app.database import AsyncSessionLocal
+            from app.models import User
+
+            async with AsyncSessionLocal() as db:
+                user = User(username=username, email=f"{username}@test.com", password_hash="x", role="user")
+                db.add(user)
+                await db.flush()
+                user_id = user.id
+                await db.commit()
+            jwt = create_access_token(user_id, "user")
+
+        key_resp = await client.post(
+            "/api/auth/api-keys",
+            headers={"Authorization": f"Bearer {jwt}"},
+            json={"name": f"{label}-test-key", "scopes": []},
+        )
+        assert key_resp.status_code == 200, key_resp.text
+    return {"X-API-Key": key_resp.json()["key"]}
+
+
 @pytest.fixture(autouse=True)
 def quickly_test_logs_dir(tmp_path, monkeypatch):
     """Route schedule debug output away from repo ``logs/`` (often not writable in CI)."""

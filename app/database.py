@@ -291,6 +291,26 @@ async def _run_migrations(conn) -> None:
             "CREATE INDEX IF NOT EXISTS ix_custom_email_override_cl ON custom_email_override (campaign_lead_id)"
         )
     )
+    # 2026-09-16: OUTBOUND-SAFETY-0A — global (cross-campaign) suppression /
+    # do-not-contact list. Additive only: no existing table is touched.
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS global_suppression (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) NOT NULL,
+                reason VARCHAR(32) NOT NULL DEFAULT 'manual_block',
+                note VARCHAR(512),
+                source VARCHAR(64),
+                created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+                CONSTRAINT uq_global_suppression_email UNIQUE (email)
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_global_suppression_email ON global_suppression (email)")
+    )
     for stmt in pg_alters:
         await conn.execute(text(stmt))
     await conn.execute(

@@ -470,3 +470,34 @@ class WebhookResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ---------------------------------------------------------------------------
+# Global suppression / do-not-contact schemas (OUTBOUND-SAFETY-0A)
+# ---------------------------------------------------------------------------
+
+class SuppressionCreate(BaseModel):
+    email: str
+    reason: str = "manual_block"
+    note: Optional[str] = None
+    source: Optional[str] = None
+
+
+class SuppressionResponse(BaseModel):
+    """No mailbox credentials/tokens/API keys are ever part of this model —
+    just the suppression record itself (email, reason, timestamps)."""
+    id: int
+    email: str
+    reason: str
+    note: Optional[str] = None
+    source: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SuppressionCheckResponse(BaseModel):
+    email: str
+    suppressed: bool
+    suppression: Optional[SuppressionResponse] = None

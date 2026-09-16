@@ -457,6 +457,28 @@ class LeadReply(Base):
     campaign = relationship("Campaign", back_populates="replies")
 
 
+class GlobalSuppression(Base):
+    """Cross-campaign do-not-contact safety layer (OUTBOUND-SAFETY-0A).
+
+    Independent of CampaignLead enrollment: checked at both enrollment-time
+    and send-fire-time so a suppressed email can never be contacted again,
+    even if it is already enrolled/queued in some other campaign. Keyed by
+    normalized (stripped + lowercased) email — see app/suppression.py for
+    the normalization + service-layer helpers used everywhere this table is
+    read or written; nothing should query/write this table directly.
+    """
+    __tablename__ = "global_suppression"
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_global_suppression_email"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), nullable=False, index=True)  # normalized: strip().lower()
+    reason = Column(String(32), nullable=False, default="manual_block")
+    note = Column(String(512), nullable=True, default=None)
+    source = Column(String(64), nullable=True, default=None)  # e.g. "unsubscribe", "send_failure", "api", "mcp"
+    created_at = Column(DateTime, default=_utcnow)
+
+
 class EmailOpen(Base):
     __tablename__ = "email_open"
     id = Column(Integer, primary_key=True, index=True)

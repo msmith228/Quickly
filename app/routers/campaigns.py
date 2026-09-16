@@ -40,6 +40,7 @@ from app.campaign_lead_status import (
     normalize_enrollment_status,
     normalize_interest,
 )
+from app.suppression import get_all_suppressed_emails, normalize_email
 from app.schemas import (
     CampaignCreate,
     CampaignUpdate,
@@ -2031,16 +2032,27 @@ async def bulk_add_leads_to_campaign(
     results = []
     added = 0
     already_enrolled = 0
+    suppressed = 0
     errors = 0
     duplicate_leads: list[str] = []
     # Track new enrollments for bulk scheduling after provider detection
     new_enrollments: list[tuple[int, int, str, bool, bool]] = []  # cl.id, lead.id, email, has_prov, can_send
+
+    # OUTBOUND-SAFETY-0A: one snapshot for the whole batch, checked per
+    # entry below — globally suppressed addresses must never be newly
+    # enrolled, no matter how they arrive (REST, CSV, MCP all funnel here).
+    suppressed_emails = await get_all_suppressed_emails(db)
 
     for entry in leads_data:
         email = entry.email.strip().lower()
         if not email:
             results.append({"email": entry.email, "status": "error", "detail": "Empty email"})
             errors += 1
+            continue
+
+        if normalize_email(email) in suppressed_emails:
+            results.append({"email": email, "status": "suppressed", "detail": "globally suppressed — not enrolled"})
+            suppressed += 1
             continue
 
         try:
@@ -2101,7 +2113,7 @@ async def bulk_add_leads_to_campaign(
             if has_personalized and (cl.enrollment_status or "active") == "active" and campaign_mode != "asap":
                 cl.enrollment_status = "needs_custom_email"
             await db.flush()
-            can_send = campaign_lead_may_receive_sends(cl, lead)
+            can_send = campaign_lead_may_receive_sends(cl, lead, suppressed_emails)
             new_enrollments.append((cl.id, lead.id, email, bool(lead.provider), can_send))
             results.append({"email": email, "status": "added", "lead_id": lead.id, "slots_created": 0})
             added += 1
@@ -2205,6 +2217,7 @@ async def bulk_add_leads_to_campaign(
         "ok": True,
         "added": added,
         "already_enrolled": already_enrolled,
+        "suppressed": suppressed,
         "duplicate_leads": duplicate_leads,
         "duplicates_in_batch": duplicates_in_batch,
         "errors": errors,
@@ -2726,6 +2739,7 @@ async def import_campaign_leads(
 
     added = 0
     already_enrolled = 0
+    suppressed = 0
     errors = 0
     duplicates_in_batch = 0
     duplicate_leads: list[str] = []
@@ -2733,6 +2747,10 @@ async def import_campaign_leads(
     seen_emails: set[str] = set()
     # Track new enrollments for bulk scheduling after provider detection
     new_enrollments: list[tuple[int, int, str, bool, bool]] = []  # cl.id, lead.id, email, has_prov, can_send
+
+    # OUTBOUND-SAFETY-0A: same batch-suppression guard as the REST bulk-add
+    # path — CSV import must not silently enroll a globally suppressed lead.
+    suppressed_emails = await get_all_suppressed_emails(db)
 
     for row_num, row in enumerate(reader, start=2):
         by_header = {}
@@ -2757,6 +2775,11 @@ async def import_campaign_leads(
             duplicates_in_batch += 1
             continue
         seen_emails.add(email)
+
+        if normalize_email(email) in suppressed_emails:
+            results_list.append({"row": row_num, "email": email, "status": "suppressed", "detail": "globally suppressed — not enrolled"})
+            suppressed += 1
+            continue
 
         name = next(
             (by_header[h] for h in raw_headers if h.lower() == "name"),
@@ -2836,7 +2859,7 @@ async def import_campaign_leads(
             if has_personalized_import and (cl.enrollment_status or "active") == "active" and campaign_mode != "asap":
                 cl.enrollment_status = "needs_custom_email"
             await db.flush()
-            can_send_csv = campaign_lead_may_receive_sends(cl, lead)
+            can_send_csv = campaign_lead_may_receive_sends(cl, lead, suppressed_emails)
             new_enrollments.append((cl.id, lead.id, email, bool(lead.provider), can_send_csv))
             added += 1
             results_list.append({"row": row_num, "email": email, "status": "added", "lead_id": lead.id})
@@ -2915,10 +2938,11 @@ async def import_campaign_leads(
         "ok": True,
         "added": added,
         "already_enrolled": already_enrolled,
+        "suppressed": suppressed,
         "duplicate_leads": duplicate_leads,
         "duplicates_in_batch": duplicates_in_batch,
         "errors": errors,
-        "total_rows": added + already_enrolled + duplicates_in_batch + errors,
+        "total_rows": added + already_enrolled + suppressed + duplicates_in_batch + errors,
         "verification_queued": verify_emails and bool(added_lead_ids_csv),
     }
 
