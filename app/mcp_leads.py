@@ -1,4 +1,16 @@
-"""Remote MCP (Streamable HTTP) for Quickly leads — mounted at ``/api/mcp``."""
+"""Remote MCP (Streamable HTTP) for Quickly — mounted at ``/api/mcp``.
+
+Originally "leads only" (module/server name kept as ``quickly-leads`` for
+URL/identity stability with existing mcp-remote configs); OUTBOUND-QUICKLY-0B
+added a small set of campaign-lifecycle, reply/Unibox, and analytics tools —
+see the instructions string below for the full, deliberately-short list.
+Every tool is a thin wrapper that proxies to the same REST endpoints the web
+UI calls (same auth, same validation, same business logic) — no tool talks
+to the database directly, and there is intentionally no send-email tool:
+an agent can prepare and control campaigns through these tools, but actual
+sending stays gated behind Quickly's own campaign engine and test-mode
+switch, never bypassed here.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +35,11 @@ log = logging.getLogger("quickly.mcp_leads")
 leads_mcp = FastMCP(
     "quickly-leads",
     instructions=(
-        "Quickly leads API tools. Authenticate MCP HTTP requests with X-API-Key "
+        "Quickly automation tools — leads, campaign lifecycle (list/get/create/"
+        "pause/resume), replies/Unibox (list/get thread), and per-campaign "
+        "analytics. No tool sends email; campaigns you create/resume here are "
+        "still governed by Quickly's own test-mode switch and send-time "
+        "eligibility checks. Authenticate MCP HTTP requests with X-API-Key "
         "(Settings → API Keys) or Authorization: Bearer (JWT)."
     ),
     # Default FastMCP host is 127.0.0.1, which enables MCP DNS-rebinding checks with
@@ -166,6 +182,124 @@ async def add_campaign_leads(
             params=params,
             json=leads,
         )
+    return _json_response(r)
+
+
+# ---------------------------------------------------------------------------
+# Campaign lifecycle (OUTBOUND-QUICKLY-0B)
+# ---------------------------------------------------------------------------
+
+
+@leads_mcp.tool()
+async def list_campaigns(ctx: Context) -> str:
+    """List every campaign with its aggregated stats (leads, sent, replies, open/click rate)."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/campaigns"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers)
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def get_campaign(ctx: Context, campaign_id: int) -> str:
+    """Get one campaign by id, including its aggregated stats."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/campaigns/{campaign_id}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers)
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def create_campaign(ctx: Context, name: str, inbox_ids: list[int] | None = None) -> str:
+    """Create a new campaign. inbox_ids may be empty (add inboxes later from
+    the UI/API before starting real sends) — a campaign created here always
+    starts as a Draft (not paused=False does not mean "sending"; it still
+    needs sequences and leads before the queue engine schedules anything)."""
+    headers = _outbound_headers(ctx)
+    if not name.strip():
+        return json.dumps({"error": "name must not be empty"})
+    url = f"{_api_base()}/api/campaigns"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            url,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"name": name, "inbox_ids": inbox_ids or []},
+        )
+    return _json_response(r)
+
+
+async def _set_campaign_paused(ctx: Context, campaign_id: int, paused: bool) -> str:
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/campaigns/{campaign_id}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.patch(
+            url,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"paused": paused},
+        )
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def pause_campaign(ctx: Context, campaign_id: int) -> str:
+    """Pause a campaign — the send queue skips it entirely until resumed. Does not send anything."""
+    return await _set_campaign_paused(ctx, campaign_id, True)
+
+
+@leads_mcp.tool()
+async def resume_campaign(ctx: Context, campaign_id: int) -> str:
+    """Resume a paused campaign. Sending still only happens through Quickly's
+    own queue engine, sending windows, and test-mode switch — resuming a
+    campaign never sends anything immediately by itself."""
+    return await _set_campaign_paused(ctx, campaign_id, False)
+
+
+@leads_mcp.tool()
+async def get_campaign_analytics(ctx: Context, campaign_id: int) -> str:
+    """Per-step analytics for a campaign: sent/opens/clicks/replies/opportunities, including any A/B variant breakdown."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/campaigns/{campaign_id}/analytics/steps"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers)
+    return _json_response(r)
+
+
+# ---------------------------------------------------------------------------
+# Replies / Unibox (OUTBOUND-QUICKLY-0B) — read/sync only, no send tool.
+# ---------------------------------------------------------------------------
+
+
+@leads_mcp.tool()
+async def list_replies(
+    ctx: Context,
+    page: int = 1,
+    page_size: int = 20,
+    leads_only: bool = True,
+) -> str:
+    """List Unibox conversation threads, newest first. leads_only=True (default)
+    shows only threads matched to a known lead — set False to see every
+    connected inbox's conversations, not just outbound-campaign replies."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/unibox"
+    params = {
+        "page": str(page),
+        "page_size": str(page_size),
+        "leads_only": "true" if leads_only else "false",
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers, params=params)
+    return _json_response(r)
+
+
+@leads_mcp.tool()
+async def get_reply_thread(ctx: Context, thread_id: str, inbox_id: int | None = None) -> str:
+    """Get every message in one Unibox thread (hydrates content on demand). Read-only — does not mark anything as read or send a reply."""
+    headers = _outbound_headers(ctx)
+    url = f"{_api_base()}/api/unibox/threads/{thread_id}"
+    params = {"inbox_id": str(inbox_id)} if inbox_id is not None else {}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers, params=params)
     return _json_response(r)
 
 
