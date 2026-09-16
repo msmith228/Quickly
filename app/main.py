@@ -253,11 +253,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Serve compiled frontend assets.  Mounted at /assets so API routes are never
 # shadowed.  The SPA entrypoint and catch-all are handled by explicit routes
 # below so that /api/* is always matched by the routers first.
-app.mount(
-    "/assets",
-    StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")),
-    name="assets",
-)
+#
+# Guarded by .exists() (same pattern as the /static mount below): the
+# production/Docker image always has frontend/dist/assets (built ahead of
+# time), but a fresh local checkout following docs/INSTALL.md's "Option D:
+# Local Development" (uvicorn app.main:app --reload, frontend served
+# separately by `npm run dev` on :5173) has no frontend/dist/ at all yet —
+# StaticFiles() raised RuntimeError at import time and uvicorn couldn't
+# start. Skipping the mount when the directory is absent lets the backend
+# boot in that dev flow (the Vite dev server serves assets instead); the
+# real assets are mounted normally as soon as `frontend/dist/assets` exists.
+if (BASE_DIR / "frontend" / "dist" / "assets").exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")),
+        name="assets",
+    )
 
 if (BASE_DIR / "static").exists():
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
