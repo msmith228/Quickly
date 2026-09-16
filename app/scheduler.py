@@ -54,7 +54,10 @@ def build_jobstores(db_url: str) -> dict:
 
     try:
         from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore  # noqa: PLC0415
-        log.info("build_jobstores: using SQLAlchemyJobStore (%s...)", sync_url[:40])
+        from sqlalchemy.engine import make_url  # noqa: PLC0415
+
+        safe_url = make_url(sync_url).render_as_string(hide_password=True)
+        log.info("build_jobstores: using SQLAlchemyJobStore (%s)", safe_url)
         return {"default": SQLAlchemyJobStore(url=sync_url)}
     except Exception as exc:
         log.warning(
